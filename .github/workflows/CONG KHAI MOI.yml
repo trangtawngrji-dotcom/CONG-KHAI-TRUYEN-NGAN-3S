@@ -235,9 +235,30 @@ jobs:
           # Cài whisper KHÔNG build isolation
           python -m pip install --no-build-isolation --no-cache-dir "openai-whisper==20231117"
           python -m pip install -U faster-whisper
+          # YAMNet (TensorFlow) để lọc nhạc
+          python -m pip install tensorflow-cpu tensorflow-hub
           # Verify
           python -c "import whisper, torch, torchaudio, numpy, cv2, pkg_resources; print('ALL OK:', whisper.__version__, torch.__version__)"
           python -m pip check || true
+
+      - name: Install Python deps
+        run: |
+          set -e
+          REQ=$(ls private-src/**/requirements*.txt 2>/dev/null | head -n1 || true)
+          if [ -n "$REQ" ]; then
+            echo "[INFO] Using requirements: $REQ"
+            python -m pip install -r "$REQ"
+          else
+            echo "[INFO] No requirements*.txt found — install tối thiểu"
+            python -m pip install Pillow opencv-python-headless numpy gdown \
+              google-api-python-client google-auth google-auth-httplib2 \
+              imageio-ffmpeg tensorflow-cpu tensorflow-hub
+          fi
+
+          # CHỐT LẠI setuptools sau khi cài requirements (để requirements không kéo lên bản mới)
+          python -m pip install --force-reinstall --no-deps "setuptools==80.9.0"
+          python -c "import setuptools, pkg_resources; print('FINAL setuptools=', setuptools.__version__, 'pkg_resources OK')"
+
 
       # Chạy code trong repo PRIVATE
       - name: Run pipeline in PRIVATE
