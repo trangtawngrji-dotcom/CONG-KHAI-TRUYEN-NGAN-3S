@@ -65,7 +65,7 @@ jobs:
 
 
       SUB_MODE: "first"
-      SUB_DURATION_SEC: "3600"
+      SUB_DURATION_SEC: "10000"
 
     steps:
       - name: Checkout wrapper (repo PUBLIC)
