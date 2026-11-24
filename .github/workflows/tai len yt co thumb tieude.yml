@@ -1,0 +1,650 @@
+name: "Google Drive Folder to YouTube"
+
+on:
+  workflow_dispatch:
+    inputs:
+      privacy_status:
+        description: "Quyền riêng tư mặc định của video mới"
+        required: true
+        default: "private"
+        type: choice
+        options:
+          - private
+          - unlisted
+          - public
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drive-to-youtube-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    name: Download from Drive and upload to YouTube
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      # Google Drive: dùng lại các Secrets của workflow cũ.
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+      GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+
+      # YouTube OAuth 2.0 refresh token.
+      YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+      YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+      YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+
+      # Mỗi lần chạy chỉ upload đúng 1 video.
+      MAX_UPLOADS: "1"
+      YOUTUBE_PRIVACY_STATUS: ${{ inputs.privacy_status || 'private' }}
+      YOUTUBE_CATEGORY_ID: "22"
+      YOUTUBE_DESCRIPTION: ""
+      YOUTUBE_TAGS: ""
+      DOWNLOAD_DIR: /tmp/drive_video_downloads
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Google API libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade \
+            google-api-python-client \
+            google-auth \
+            google-auth-httplib2
+
+      - name: Validate required secrets and prepare script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -n "${GDRIVE_FOLDER_ID//[[:space:]]/}" ]] || {
+            echo "::error::Thiếu Secret GDRIVE_FOLDER_ID."
+            exit 1
+          }
+
+          if [[ -z "${GDRIVE_OAUTH_TOKEN_JSON//[[:space:]]/}" && -z "${GDRIVE_SA_JSON//[[:space:]]/}" ]]; then
+            echo "::error::Cần GDRIVE_OAUTH_TOKEN_JSON hoặc GDRIVE_SA_JSON để đọc Drive."
+            exit 1
+          fi
+
+          [[ -n "${YT_CLIENT_ID//[[:space:]]/}" ]] || {
+            echo "::error::Thiếu Secret YT_CLIENT_ID."
+            exit 1
+          }
+          [[ -n "${YT_CLIENT_SECRET//[[:space:]]/}" ]] || {
+            echo "::error::Thiếu Secret YT_CLIENT_SECRET."
+            exit 1
+          }
+          [[ -n "${YT_REFRESH_TOKEN//[[:space:]]/}" ]] || {
+            echo "::error::Thiếu Secret YT_REFRESH_TOKEN."
+            exit 1
+          }
+
+          if ! [[ "$MAX_UPLOADS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::max_uploads phải là số nguyên lớn hơn 0."
+            exit 1
+          fi
+
+          case "$YOUTUBE_PRIVACY_STATUS" in
+            private|unlisted|public) ;;
+            *) echo "::error::privacy_status phải là private, unlisted hoặc public."; exit 1 ;;
+          esac
+
+          mkdir -p "$DOWNLOAD_DIR"
+          echo "Secrets đã được khai báo; không hiển thị nội dung bí mật trong log."
+
+      - name: Read title and thumbnails, then upload Drive videos to YouTube
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/drive_to_youtube.py" <<'PY'
+          import json
+          import mimetypes
+          import os
+          import re
+          import sys
+          from pathlib import Path
+          
+          from google.auth.transport.requests import Request
+          from google.oauth2.credentials import Credentials
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.errors import HttpError
+          from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+          
+          DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+          YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+          VIDEO_EXTENSIONS = {
+              ".mp4", ".mov", ".m4v", ".avi", ".wmv", ".flv",
+              ".webm", ".mkv", ".mpeg", ".mpg", ".3gp", ".ogv",
+              ".mts", ".m2ts", ".ts"
+          }
+          THUMB_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+          CHUNK_SIZE = 8 * 1024 * 1024
+          MAX_THUMBNAIL_BYTES = 50_000_000
+          
+          
+          def required_env(name: str) -> str:
+              value = os.environ.get(name, "").strip()
+              if not value:
+                  raise RuntimeError(f"Thiếu biến môi trường {name}.")
+              return value
+          
+          
+          def build_drive_service():
+              token_json = os.environ.get("GDRIVE_OAUTH_TOKEN_JSON", "").strip()
+              sa_json = os.environ.get("GDRIVE_SA_JSON", "").strip()
+          
+              if token_json:
+                  try:
+                      info = json.loads(token_json)
+                      creds = Credentials.from_authorized_user_info(info, scopes=DRIVE_SCOPES)
+                  except Exception as exc:
+                      raise RuntimeError(
+                          f"GDRIVE_OAUTH_TOKEN_JSON không hợp lệ: {exc}"
+                      ) from exc
+          
+                  if creds.expired and creds.refresh_token:
+                      creds.refresh(Request())
+                  if not creds.valid:
+                      raise RuntimeError(
+                          "Drive OAuth token không hợp lệ hoặc không thể refresh."
+                      )
+                  print("[Drive] Đã xác thực bằng GDRIVE_OAUTH_TOKEN_JSON.")
+                  return build("drive", "v3", credentials=creds, cache_discovery=False)
+          
+              try:
+                  info = json.loads(sa_json)
+                  creds = service_account.Credentials.from_service_account_info(
+                      info, scopes=DRIVE_SCOPES
+                  )
+                  print("[Drive] Đã xác thực bằng GDRIVE_SA_JSON.")
+                  return build("drive", "v3", credentials=creds, cache_discovery=False)
+              except Exception as exc:
+                  raise RuntimeError(f"GDRIVE_SA_JSON không hợp lệ: {exc}") from exc
+          
+          
+          def build_youtube_service():
+              creds = Credentials(
+                  token=None,
+                  refresh_token=required_env("YT_REFRESH_TOKEN"),
+                  token_uri="https://oauth2.googleapis.com/token",
+                  client_id=required_env("YT_CLIENT_ID"),
+                  client_secret=required_env("YT_CLIENT_SECRET"),
+                  scopes=YOUTUBE_SCOPES,
+              )
+              try:
+                  creds.refresh(Request())
+              except Exception as exc:
+                  raise RuntimeError(
+                      "Không refresh được YT_REFRESH_TOKEN. Kiểm tra token có được cấp bằng "
+                      "đúng YT_CLIENT_ID/YT_CLIENT_SECRET và có scope youtube.upload hay không. "
+                      f"Chi tiết: {exc}"
+                  ) from exc
+          
+              print("[YouTube] OAuth refresh token hợp lệ; đã lấy access token.")
+              return build("youtube", "v3", credentials=creds, cache_discovery=False)
+          
+          
+          def get_folder(drive, folder_id: str):
+              folder = drive.files().get(
+                  fileId=folder_id,
+                  fields="id,name,mimeType",
+                  supportsAllDrives=True,
+              ).execute()
+              if folder.get("mimeType") != "application/vnd.google-apps.folder":
+                  raise RuntimeError(
+                      f"GDRIVE_FOLDER_ID không trỏ tới thư mục: {folder.get('name')}"
+                  )
+              print(f"[Drive] Thư mục nguồn: {folder.get('name')} ({folder_id})")
+              return folder
+          
+          
+          def list_folder_files(drive, folder_id: str):
+              files = []
+              page_token = None
+              while True:
+                  response = drive.files().list(
+                      q=f"'{folder_id}' in parents and trashed = false",
+                      pageSize=1000,
+                      pageToken=page_token,
+                      orderBy="name",
+                      fields=(
+                          "nextPageToken,files(id,name,mimeType,size,modifiedTime,"
+                          "capabilities(canDownload))"
+                      ),
+                      supportsAllDrives=True,
+                      includeItemsFromAllDrives=True,
+                      corpora="allDrives",
+                  ).execute()
+                  files.extend(response.get("files", []))
+                  page_token = response.get("nextPageToken")
+                  if not page_token:
+                      break
+              return sorted(files, key=lambda item: item.get("name", "").casefold())
+          
+          
+          def is_video(file_meta):
+              mime = (file_meta.get("mimeType") or "").lower()
+              suffix = Path(file_meta.get("name", "")).suffix.lower()
+              return mime.startswith("video/") or suffix in VIDEO_EXTENSIONS
+          
+          
+          def is_thumbnail(file_meta):
+              mime = (file_meta.get("mimeType") or "").lower()
+              suffix = Path(file_meta.get("name", "")).suffix.lower()
+              return suffix in THUMB_EXTENSIONS and (mime.startswith("image/") or not mime)
+          
+          
+          def safe_local_name(name: str, file_id: str) -> str:
+              base = Path(name).name.replace("/", "_").replace("\\", "_")
+              base = re.sub(r"[^\w.()\- \[\]]", "_", base, flags=re.UNICODE).strip()
+              return f"{file_id[-8:]}_{base or 'drive_file'}"
+          
+          
+          def download_drive_file(drive, file_meta, output_dir: Path) -> Path:
+              file_id = file_meta["id"]
+              local_path = output_dir / safe_local_name(file_meta["name"], file_id)
+              request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+              with local_path.open("wb") as handle:
+                  downloader = MediaIoBaseDownload(handle, request, chunksize=CHUNK_SIZE)
+                  done = False
+                  while not done:
+                      status, done = downloader.next_chunk(num_retries=5)
+                      if status:
+                          print(
+                              f"[Drive] Tải {file_meta['name']}: "
+                              f"{int(status.progress() * 100)}%"
+                          )
+              if not local_path.exists() or local_path.stat().st_size == 0:
+                  raise RuntimeError(f"File tải từ Drive rỗng hoặc không tồn tại: {file_meta['name']}")
+              return local_path
+          
+          
+          def load_titles(title_path: Path, video_files):
+              if not title_path.is_file():
+                  print(
+                      f"::warning::Không tìm thấy {title_path.name} trong repository; "
+                      "sẽ dùng tên file video làm tiêu đề."
+                  )
+                  return {}, []
+
+              content = title_path.read_text(encoding="utf-8-sig", errors="replace")
+              keyed_titles = {}
+              positional_titles = []
+              for raw_line in content.splitlines():
+                  line = raw_line.strip()
+                  if not line:
+                      continue
+                  # Dạng ghép chính xác: ten_video.mp4|Tiêu đề riêng
+                  if "|" in line:
+                      key, title = line.split("|", 1)
+                      key, title = key.strip(), title.strip()
+                      if key and title:
+                          keyed_titles[normalize_video_key(key)] = title
+                          continue
+                  # Dạng mỗi dòng là một tiêu đề; thứ tự video A-Z.
+                  positional_titles.append(line)
+
+              print(
+                  f"[Title] Đọc {title_path}: {len(keyed_titles)} tiêu đề theo tên file, "
+                  f"{len(positional_titles)} tiêu đề theo thứ tự A-Z."
+              )
+              if positional_titles and len(positional_titles) not in {1, len(video_files)}:
+                  print(
+                      "::warning::Số tiêu đề dạng từng dòng không bằng số video. "
+                      "Video không có dòng tương ứng sẽ dùng tên file làm tiêu đề."
+                  )
+              return keyed_titles, positional_titles
+
+
+          def normalize_video_key(name: str) -> str:
+              value = Path(name.strip()).name.casefold()
+              suffix = Path(value).suffix
+              if suffix in VIDEO_EXTENSIONS:
+                  return Path(value).stem.casefold()
+              return value
+          
+          
+          def resolve_title(file_meta, index: int, keyed_titles, positional_titles) -> str:
+              filename = file_meta.get("name", "")
+              stem = Path(filename).stem
+              title = keyed_titles.get(normalize_video_key(filename))
+              if title is None:
+                  title = keyed_titles.get(normalize_video_key(stem))
+              if title is None and index < len(positional_titles):
+                  title = positional_titles[index]
+              # Nếu tieude.txt chỉ có các dòng dạng ten_video|Tiêu đề
+              # nhưng không có khóa trùng tên video đang chọn, dùng tiêu đề đầu tiên có sẵn.
+              if title is None and keyed_titles:
+                  title = next(iter(keyed_titles.values()))
+              if title is None:
+                  title = stem
+              title = re.sub(r"\s+", " ", title).strip()
+              return (title or "Untitled video")[:100]
+          
+          
+          def thumbnail_key(name: str) -> str:
+              # Hỗ trợ cả thumb/video.jpg và thumb/video.mp4.jpg.
+              stem = Path(name).stem.casefold()
+              if Path(stem).suffix in VIDEO_EXTENSIONS:
+                  stem = Path(stem).stem.casefold()
+              return stem
+          
+          
+          def is_thumbnail_path(path: Path) -> bool:
+              return path.is_file() and path.suffix.lower() in THUMB_EXTENSIONS
+
+
+          def map_thumbnails(video_files, thumb_dir: Path):
+              if not thumb_dir.is_dir():
+                  print(
+                      f"::warning::Không tìm thấy thư mục {thumb_dir.name}/ trong repository; "
+                      "video sẽ dùng thumbnail YouTube tự tạo."
+                  )
+                  return {}
+
+              images = sorted(
+                  [path for path in thumb_dir.iterdir() if is_thumbnail_path(path)],
+                  key=lambda path: path.name.casefold(),
+              )
+              if not images:
+                  print(
+                      "::warning::Thư mục thumb/ không có ảnh JPG/JPEG/PNG hợp lệ; "
+                      "video sẽ dùng thumbnail YouTube tự tạo."
+                  )
+                  return {}
+
+              by_key = {}
+              duplicate_keys = set()
+              for image_path in images:
+                  key = thumbnail_key(image_path.name)
+                  if key in by_key:
+                      duplicate_keys.add(key)
+                  else:
+                      by_key[key] = image_path
+              for key in duplicate_keys:
+                  by_key.pop(key, None)
+
+              mapping = {}
+              used_paths = set()
+              for video in video_files:
+                  key = normalize_video_key(video.get("name", ""))
+                  image_path = by_key.get(key)
+                  if image_path:
+                      mapping[video["id"]] = image_path
+                      used_paths.add(image_path)
+
+              remaining_videos = [v for v in video_files if v["id"] not in mapping]
+              remaining_images = [path for path in images if path not in used_paths]
+
+              if len(images) == 1:
+                  for video in remaining_videos:
+                      mapping[video["id"]] = images[0]
+              elif len(remaining_videos) == len(remaining_images) and remaining_videos:
+                  for video, image_path in zip(remaining_videos, remaining_images):
+                      mapping[video["id"]] = image_path
+                  print("[Thumb] Các ảnh không trùng tên được ghép theo thứ tự A-Z.")
+              elif remaining_videos:
+                  print(
+                      f"::warning::Không ghép được thumbnail cho {len(remaining_videos)} video còn lại. "
+                      "Sẽ dùng ảnh đầu tiên trong thumb/ cho video được chọn lần này."
+                  )
+
+              print(f"[Thumb] Tìm thấy {len(images)} ảnh; ghép được {len(mapping)}/{len(video_files)} video.")
+              return mapping
+
+
+          def upload_media_resumable(request, label: str):
+              response = None
+              last_log = -10
+              while response is None:
+                  status, response = request.next_chunk(num_retries=5)
+                  if status:
+                      percent = int(status.progress() * 100)
+                      if percent >= last_log + 10 or percent == 100:
+                          print(f"[{label}] Upload tiến độ: {percent}%")
+                          last_log = percent
+              return response
+          
+          
+          def upload_thumbnail(youtube, video_id: str, thumb_path: Path):
+              size = thumb_path.stat().st_size
+              if size <= 0:
+                  raise RuntimeError("File thumbnail rỗng.")
+              if size > MAX_THUMBNAIL_BYTES:
+                  raise RuntimeError(
+                      f"Thumbnail vượt giới hạn 50 MB: {size / (1024 * 1024):.1f} MB."
+                  )
+          
+              suffix = thumb_path.suffix.lower()
+              mime = "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png"
+              request = youtube.thumbnails().set(
+                  videoId=video_id,
+                  media_body=MediaFileUpload(
+                      str(thumb_path),
+                      mimetype=mime,
+                      chunksize=CHUNK_SIZE,
+                      resumable=True,
+                  ),
+              )
+              upload_media_resumable(request, "YouTube Thumbnail")
+          
+          
+          def upload_to_youtube(youtube, local_path: Path, title: str):
+              privacy = os.environ.get("YOUTUBE_PRIVACY_STATUS", "private").strip()
+              if privacy not in {"private", "unlisted", "public"}:
+                  raise RuntimeError("YOUTUBE_PRIVACY_STATUS không hợp lệ.")
+          
+              category_id = os.environ.get("YOUTUBE_CATEGORY_ID", "22").strip() or "22"
+              description = os.environ.get("YOUTUBE_DESCRIPTION", "").strip()
+              tags = [
+                  item.strip()
+                  for item in os.environ.get("YOUTUBE_TAGS", "").split(",")
+                  if item.strip()
+              ]
+          
+              snippet = {
+                  "title": title,
+                  "description": description,
+                  "categoryId": category_id,
+              }
+              if tags:
+                  snippet["tags"] = tags[:500]
+          
+              body = {
+                  "snippet": snippet,
+                  "status": {
+                      "privacyStatus": privacy,
+                      "selfDeclaredMadeForKids": False,
+                  },
+              }
+          
+              media_mime = mimetypes.guess_type(local_path.name)[0]
+              if not media_mime or not media_mime.startswith("video/"):
+                  media_mime = "application/octet-stream"
+          
+              request = youtube.videos().insert(
+                  part="snippet,status",
+                  body=body,
+                  media_body=MediaFileUpload(
+                      str(local_path),
+                      mimetype=media_mime,
+                      chunksize=CHUNK_SIZE,
+                      resumable=True,
+                  ),
+                  notifySubscribers=False,
+              )
+              response = upload_media_resumable(request, "YouTube Video")
+              video_id = response.get("id") if response else None
+              if not video_id:
+                  raise RuntimeError("YouTube không trả về video ID sau upload.")
+              return video_id
+          
+          
+          def main():
+              folder_id = required_env("GDRIVE_FOLDER_ID")
+              max_uploads = int(os.environ.get("MAX_UPLOADS", "5"))
+              if max_uploads < 1:
+                  raise RuntimeError("MAX_UPLOADS phải lớn hơn 0.")
+          
+              output_dir = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/drive_video_downloads"))
+              output_dir.mkdir(parents=True, exist_ok=True)
+          
+              drive = build_drive_service()
+              youtube = build_youtube_service()
+              get_folder(drive, folder_id)
+              root_files = list_folder_files(drive, folder_id)
+              video_files = [item for item in root_files if is_video(item)]
+              print(f"[Drive] Tổng file trực tiếp trong thư mục: {len(root_files)}")
+              print(f"[Drive] Video nhận diện được: {len(video_files)}")
+          
+              if not video_files:
+                  print("Không tìm thấy video nào ở cấp gốc của thư mục Drive.")
+                  return
+          
+              video_files = [
+                  item for item in video_files
+                  if item.get("capabilities", {}).get("canDownload") is not False
+              ]
+              if not video_files:
+                  raise RuntimeError("Không có video nào có quyền tải xuống từ Drive.")
+          
+              # tieude.txt và thumb/ được lấy từ repository GitHub đã checkout,
+              # không phải từ Google Drive.
+              repository_root = Path.cwd()
+              title_file = repository_root / "tieude.txt"
+              thumb_dir = repository_root / "thumb"
+              keyed_titles, positional_titles = load_titles(title_file, video_files)
+              thumb_mapping = map_thumbnails(video_files, thumb_dir)
+          
+              # Chỉ chọn video đầu tiên theo thứ tự tên A-Z cho mỗi lần chạy.
+              selected_videos = video_files[:1]
+              print(
+                  f"[Queue] Lần chạy này sẽ upload đúng {len(selected_videos)} video "
+                  f"trong tổng số {len(video_files)} video."
+              )
+              print("[History] Không đọc hoặc ghi lịch sử upload. Mỗi lần chạy sẽ xét lại video từ đầu.")
+          
+              video_position = {item["id"]: index for index, item in enumerate(video_files)}
+          
+              video_succeeded = 0
+              video_failed = 0
+              thumbnail_succeeded = 0
+              thumbnail_failed = 0
+              stop_for_quota = False
+          
+              for index, item in enumerate(selected_videos, start=1):
+                  original_name = item.get("name", "video")
+                  title = resolve_title(item, video_position[item["id"]], keyed_titles, positional_titles)
+                  print(f"\n[{index}/{len(selected_videos)}] Video: {original_name}")
+                  print(f"[Title] Tiêu đề YouTube: {title}")
+          
+                  local_video = None
+                  local_thumb = None
+                  try:
+                      local_video = download_drive_file(drive, item, output_dir)
+                      print(f"[Drive] Đã tải video {local_video.stat().st_size / (1024 * 1024):.1f} MB.")
+          
+                      video_id = upload_to_youtube(youtube, local_video, title)
+                      video_succeeded += 1
+                      print(f"[YouTube] Video upload thành công: https://www.youtube.com/watch?v={video_id}")
+          
+                      thumb_path = thumb_mapping.get(item["id"])
+                      # Nếu chưa ghép được theo tên/thứ tự, lấy ảnh đầu tiên A-Z
+                      # trong thư mục thumb/ của repository cho video lần này.
+                      if thumb_path is None:
+                          available_thumbs = sorted(
+                              [path for path in thumb_dir.iterdir() if is_thumbnail_path(path)],
+                              key=lambda path: path.name.casefold(),
+                          ) if thumb_dir.is_dir() else []
+                          if available_thumbs:
+                              thumb_path = available_thumbs[0]
+                      if thumb_path:
+                          try:
+                              local_thumb = thumb_path
+                              upload_thumbnail(youtube, video_id, local_thumb)
+                              thumbnail_succeeded += 1
+                              print(f"[YouTube] Đã đặt thumbnail từ repository: {thumb_path.name}")
+                          except Exception as thumb_exc:
+                              thumbnail_failed += 1
+                              print(
+                                  f"::error::Video đã upload nhưng đặt thumbnail thất bại "
+                                  f"({thumb_path.name}): {thumb_exc}"
+                              )
+                      else:
+                          print("::warning::Không có ảnh trong repository thumb/; giữ thumbnail YouTube tự tạo.")
+          
+                  except HttpError as exc:
+                      video_failed += 1
+                      detail = getattr(exc, "content", b"")
+                      if isinstance(detail, bytes):
+                          detail = detail.decode("utf-8", errors="replace")
+                      print(f"::error::YouTube/Drive API lỗi với {original_name}: HTTP {exc.status_code} {detail}")
+                      if exc.status_code == 403 and any(
+                          marker in str(detail).lower()
+                          for marker in (
+                              "quotaexceeded", "dailylimitexceeded", "uploadlimitexceeded"
+                          )
+                      ):
+                          print("[STOP] API báo vượt quota/giới hạn upload; dừng các video còn lại.")
+                          stop_for_quota = True
+          
+                  except Exception as exc:
+                      video_failed += 1
+                      print(f"::error::Lỗi với video {original_name}: {exc}")
+          
+                  finally:
+                      # Chỉ xóa video đã tải tạm từ Drive. Thumbnail nằm trong
+                      # repository checkout nên không xóa file nguồn.
+                      if local_video and local_video.exists():
+                          try:
+                              local_video.unlink()
+                          except OSError as exc:
+                              print(f"::warning::Không xóa được file tạm {local_video.name}: {exc}")
+          
+                  if stop_for_quota:
+                      break
+          
+              print("\n========== KẾT QUẢ ==========")
+              print(f"Video upload thành công: {video_succeeded}")
+              print(f"Video upload thất bại: {video_failed}")
+              print(f"Thumbnail đặt thành công: {thumbnail_succeeded}")
+              print(f"Thumbnail đặt thất bại: {thumbnail_failed}")
+              if len(video_files) > 1:
+                  print(f"Còn {len(video_files) - 1} video chưa được chọn trong lần chạy này.")
+              if stop_for_quota:
+                  raise RuntimeError("Đã dừng vì giới hạn quota/upload của Google API.")
+              if video_failed or thumbnail_failed:
+                  raise RuntimeError(
+                      f"Có lỗi: {video_failed} video thất bại, {thumbnail_failed} thumbnail thất bại."
+                  )
+          
+          
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as exc:
+                  print(f"::error::{exc}")
+                  sys.exit(1)
+          PY
+
+          python -u "$RUNNER_TEMP/drive_to_youtube.py"
+
+      - name: Show remaining runner disk space
+        if: always()
+        shell: bash
+        run: df -h "$RUNNER_TEMP" || true
