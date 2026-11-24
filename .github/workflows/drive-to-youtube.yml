@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       max_uploads:
-        description: "Số video tối đa trong một lần chạy"
+        description: "Số video tối đa trong một lần chạy; 0 = tải tất cả video"
         required: false
-        default: "5"
+        default: "0"
         type: string
       privacy_status:
         description: "Quyền riêng tư mặc định của video mới"
@@ -42,7 +42,7 @@ jobs:
       YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
       YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
 
-      MAX_UPLOADS: ${{ inputs.max_uploads || '5' }}
+      MAX_UPLOADS: ${{ inputs.max_uploads || '0' }}
       YOUTUBE_PRIVACY_STATUS: ${{ inputs.privacy_status || 'private' }}
       YOUTUBE_CATEGORY_ID: "22"
       YOUTUBE_DESCRIPTION: ""
@@ -97,8 +97,8 @@ jobs:
             exit 1
           }
 
-          if ! [[ "$MAX_UPLOADS" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::max_uploads phải là số nguyên lớn hơn 0."
+          if ! [[ "$MAX_UPLOADS" =~ ^[0-9]+$ ]]; then
+            echo "::error::max_uploads phải là số nguyên không âm; 0 = tất cả."
             exit 1
           fi
 
@@ -121,7 +121,6 @@ jobs:
           import re
           import sys
           import time
-          from datetime import datetime, timezone
           from pathlib import Path
 
           from google.auth.transport.requests import Request
@@ -229,7 +228,7 @@ jobs:
                       orderBy="name",
                       fields=(
                           "nextPageToken,files(id,name,mimeType,size,modifiedTime,"
-                          "appProperties,capabilities(canDownload))"
+                          "capabilities(canDownload))"
                       ),
                       supportsAllDrives=True,
                       includeItemsFromAllDrives=True,
@@ -336,24 +335,11 @@ jobs:
                   raise RuntimeError("YouTube không trả về video ID sau upload.")
               return video_id
 
-          def mark_drive_file_uploaded(drive, file_meta, video_id: str):
-              properties = dict(file_meta.get("appProperties") or {})
-              properties.update({
-                  "youtubeVideoId": video_id,
-                  "youtubeUploadedAt": datetime.now(timezone.utc).isoformat(),
-              })
-              drive.files().update(
-                  fileId=file_meta["id"],
-                  body={"appProperties": properties},
-                  fields="id,appProperties",
-                  supportsAllDrives=True,
-              ).execute()
-
           def main():
               folder_id = required_env("GDRIVE_FOLDER_ID")
-              max_uploads = int(os.environ.get("MAX_UPLOADS", "5"))
-              if max_uploads < 1:
-                  raise RuntimeError("MAX_UPLOADS phải lớn hơn 0.")
+              max_uploads = int(os.environ.get("MAX_UPLOADS", "0"))
+              if max_uploads < 0:
+                  raise RuntimeError("MAX_UPLOADS phải bằng 0 (tất cả) hoặc số dương.")
 
               output_dir = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/drive_video_downloads"))
               output_dir.mkdir(parents=True, exist_ok=True)
@@ -369,30 +355,23 @@ jobs:
 
               pending = []
               for item in video_files:
-                  props = item.get("appProperties") or {}
-                  existing_video_id = props.get("youtubeVideoId")
-                  if existing_video_id:
-                      print(
-                          f"[SKIP] {item['name']} đã upload trước đó "
-                          f"(YouTube ID: {existing_video_id})."
-                      )
-                      continue
                   if item.get("capabilities", {}).get("canDownload") is False:
                       print(f"[SKIP] Không có quyền tải file: {item['name']}")
                       continue
                   pending.append(item)
 
-              print(f"[Queue] Video chưa upload: {len(pending)}")
+              print(f"[Queue] Video sẽ upload trong lần chạy này: {len(pending)}")
               if not pending:
-                  print("Không có video mới cần upload.")
+                  print("Thư mục không có video tải xuống được.")
                   return
 
               succeeded = 0
               failed = 0
               stop_for_quota = False
 
-              for index, item in enumerate(pending[:max_uploads], start=1):
-                  print(f"\n[{index}/{min(len(pending), max_uploads)}] {item['name']}")
+              selected = pending if max_uploads == 0 else pending[:max_uploads]
+              for index, item in enumerate(selected, start=1):
+                  print(f"\n[{index}/{len(selected)}] {item['name']}")
                   local_path = None
                   try:
                       local_path = download_drive_file(drive, item, output_dir)
@@ -402,15 +381,8 @@ jobs:
                       video_id = upload_to_youtube(youtube, local_path)
                       print(f"[YouTube] Upload thành công: https://www.youtube.com/watch?v={video_id}")
 
-                      try:
-                          mark_drive_file_uploaded(drive, item, video_id)
-                          print("[Drive] Đã ghi dấu file đã upload để tránh đăng trùng.")
-                      except Exception as mark_exc:
-                          print(
-                              "::warning::Video đã lên YouTube nhưng không ghi được dấu "
-                              f"trên Drive; lần chạy sau có thể upload trùng: {mark_exc}"
-                          )
-
+                      # Không ghi lịch sử upload vào metadata Google Drive.
+                      # Mỗi lần Run, file trong thư mục đều được xét upload lại.
                       succeeded += 1
 
                   except HttpError as exc:
@@ -441,8 +413,8 @@ jobs:
               print("\n========== KẾT QUẢ ==========")
               print(f"Upload thành công: {succeeded}")
               print(f"Upload thất bại: {failed}")
-              if len(pending) > max_uploads:
-                  print(f"Còn {len(pending) - max_uploads} video chờ lần chạy tiếp theo.")
+              if max_uploads > 0 and len(pending) > max_uploads:
+                  print(f"Còn {len(pending) - max_uploads} video chưa được xử lý do giới hạn MAX_UPLOADS.")
               if stop_for_quota:
                   raise RuntimeError("YouTube quota/upload limit đã đạt; đã dừng để tránh thử tiếp vô ích.")
               if failed:
