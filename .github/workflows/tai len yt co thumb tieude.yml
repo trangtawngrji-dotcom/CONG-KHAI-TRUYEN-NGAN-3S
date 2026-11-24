@@ -274,138 +274,50 @@ jobs:
               return local_path
           
           
-          def load_titles(title_path: Path, video_files):
+          def load_title(title_path: Path) -> str:
               if not title_path.is_file():
-                  print(
-                      f"::warning::Không tìm thấy {title_path.name} trong repository; "
-                      "sẽ dùng tên file video làm tiêu đề."
+                  raise RuntimeError(
+                      f"Không tìm thấy file tiêu đề trong repository: {title_path}"
                   )
-                  return {}, []
 
-              content = title_path.read_text(encoding="utf-8-sig", errors="replace")
-              keyed_titles = {}
-              positional_titles = []
-              for raw_line in content.splitlines():
-                  line = raw_line.strip()
-                  if not line:
-                      continue
-                  # Dạng ghép chính xác: ten_video.mp4|Tiêu đề riêng
-                  if "|" in line:
-                      key, title = line.split("|", 1)
-                      key, title = key.strip(), title.strip()
-                      if key and title:
-                          keyed_titles[normalize_video_key(key)] = title
-                          continue
-                  # Dạng mỗi dòng là một tiêu đề; thứ tự video A-Z.
-                  positional_titles.append(line)
-
-              print(
-                  f"[Title] Đọc {title_path}: {len(keyed_titles)} tiêu đề theo tên file, "
-                  f"{len(positional_titles)} tiêu đề theo thứ tự A-Z."
-              )
-              if positional_titles and len(positional_titles) not in {1, len(video_files)}:
-                  print(
-                      "::warning::Số tiêu đề dạng từng dòng không bằng số video. "
-                      "Video không có dòng tương ứng sẽ dùng tên file làm tiêu đề."
+              # Toàn bộ nội dung tieude.txt là MỘT tiêu đề duy nhất.
+              content = title_path.read_text(encoding="utf-8-sig")
+              title = re.sub(r"\s+", " ", content).strip()
+              if not title:
+                  raise RuntimeError("File tieude.txt đang trống, không có tiêu đề để upload.")
+              if len(title) > 100:
+                  raise RuntimeError(
+                      f"Tiêu đề trong tieude.txt dài {len(title)} ký tự; "
+                      "YouTube giới hạn tiêu đề video tối đa 100 ký tự. "
+                      "Hãy rút ngắn tieude.txt."
                   )
-              return keyed_titles, positional_titles
+
+              print(f"[Title] Đã đọc một tiêu đề duy nhất từ {title_path}: {title}")
+              return title
 
 
-          def normalize_video_key(name: str) -> str:
-              value = Path(name.strip()).name.casefold()
-              suffix = Path(value).suffix
-              if suffix in VIDEO_EXTENSIONS:
-                  return Path(value).stem.casefold()
-              return value
-          
-          
-          def resolve_title(file_meta, index: int, keyed_titles, positional_titles) -> str:
-              filename = file_meta.get("name", "")
-              stem = Path(filename).stem
-              title = keyed_titles.get(normalize_video_key(filename))
-              if title is None:
-                  title = keyed_titles.get(normalize_video_key(stem))
-              if title is None and index < len(positional_titles):
-                  title = positional_titles[index]
-              # Nếu tieude.txt chỉ có các dòng dạng ten_video|Tiêu đề
-              # nhưng không có khóa trùng tên video đang chọn, dùng tiêu đề đầu tiên có sẵn.
-              if title is None and keyed_titles:
-                  title = next(iter(keyed_titles.values()))
-              if title is None:
-                  title = stem
-              title = re.sub(r"\s+", " ", title).strip()
-              return (title or "Untitled video")[:100]
-          
-          
-          def thumbnail_key(name: str) -> str:
-              # Hỗ trợ cả thumb/video.jpg và thumb/video.mp4.jpg.
-              stem = Path(name).stem.casefold()
-              if Path(stem).suffix in VIDEO_EXTENSIONS:
-                  stem = Path(stem).stem.casefold()
-              return stem
-          
-          
           def is_thumbnail_path(path: Path) -> bool:
               return path.is_file() and path.suffix.lower() in THUMB_EXTENSIONS
 
 
-          def map_thumbnails(video_files, thumb_dir: Path):
+          def load_thumbnail(thumb_dir: Path) -> Path:
               if not thumb_dir.is_dir():
-                  print(
-                      f"::warning::Không tìm thấy thư mục {thumb_dir.name}/ trong repository; "
-                      "video sẽ dùng thumbnail YouTube tự tạo."
-                  )
-                  return {}
-
-              images = sorted(
-                  [path for path in thumb_dir.iterdir() if is_thumbnail_path(path)],
-                  key=lambda path: path.name.casefold(),
-              )
-              if not images:
-                  print(
-                      "::warning::Thư mục thumb/ không có ảnh JPG/JPEG/PNG hợp lệ; "
-                      "video sẽ dùng thumbnail YouTube tự tạo."
-                  )
-                  return {}
-
-              by_key = {}
-              duplicate_keys = set()
-              for image_path in images:
-                  key = thumbnail_key(image_path.name)
-                  if key in by_key:
-                      duplicate_keys.add(key)
-                  else:
-                      by_key[key] = image_path
-              for key in duplicate_keys:
-                  by_key.pop(key, None)
-
-              mapping = {}
-              used_paths = set()
-              for video in video_files:
-                  key = normalize_video_key(video.get("name", ""))
-                  image_path = by_key.get(key)
-                  if image_path:
-                      mapping[video["id"]] = image_path
-                      used_paths.add(image_path)
-
-              remaining_videos = [v for v in video_files if v["id"] not in mapping]
-              remaining_images = [path for path in images if path not in used_paths]
-
-              if len(images) == 1:
-                  for video in remaining_videos:
-                      mapping[video["id"]] = images[0]
-              elif len(remaining_videos) == len(remaining_images) and remaining_videos:
-                  for video, image_path in zip(remaining_videos, remaining_images):
-                      mapping[video["id"]] = image_path
-                  print("[Thumb] Các ảnh không trùng tên được ghép theo thứ tự A-Z.")
-              elif remaining_videos:
-                  print(
-                      f"::warning::Không ghép được thumbnail cho {len(remaining_videos)} video còn lại. "
-                      "Sẽ dùng ảnh đầu tiên trong thumb/ cho video được chọn lần này."
+                  raise RuntimeError(
+                      f"Không tìm thấy thư mục thumbnail trong repository: {thumb_dir}"
                   )
 
-              print(f"[Thumb] Tìm thấy {len(images)} ảnh; ghép được {len(mapping)}/{len(video_files)} video.")
-              return mapping
+              # Không ghép tên, không ưu tiên, không chọn ảnh dự phòng.
+              # Thư mục thumb/ phải chứa đúng một ảnh JPG/JPEG/PNG.
+              images = [path for path in thumb_dir.iterdir() if is_thumbnail_path(path)]
+              if len(images) != 1:
+                  raise RuntimeError(
+                      f"Thư mục thumb/ phải có đúng 1 ảnh JPG/JPEG/PNG, "
+                      f"nhưng hiện tìm thấy {len(images)} ảnh hợp lệ."
+                  )
+
+              image_path = images[0]
+              print(f"[Thumb] Đã chọn file ảnh duy nhất trong thumb/: {image_path.name}")
+              return image_path
 
 
           def upload_media_resumable(request, label: str):
@@ -528,8 +440,8 @@ jobs:
               repository_root = Path.cwd()
               title_file = repository_root / "tieude.txt"
               thumb_dir = repository_root / "thumb"
-              keyed_titles, positional_titles = load_titles(title_file, video_files)
-              thumb_mapping = map_thumbnails(video_files, thumb_dir)
+              title = load_title(title_file)
+              thumb_path = load_thumbnail(thumb_dir)
           
               # Chỉ chọn video đầu tiên theo thứ tự tên A-Z cho mỗi lần chạy.
               selected_videos = video_files[:1]
@@ -539,7 +451,6 @@ jobs:
               )
               print("[History] Không đọc hoặc ghi lịch sử upload. Mỗi lần chạy sẽ xét lại video từ đầu.")
           
-              video_position = {item["id"]: index for index, item in enumerate(video_files)}
           
               video_succeeded = 0
               video_failed = 0
@@ -549,9 +460,8 @@ jobs:
           
               for index, item in enumerate(selected_videos, start=1):
                   original_name = item.get("name", "video")
-                  title = resolve_title(item, video_position[item["id"]], keyed_titles, positional_titles)
                   print(f"\n[{index}/{len(selected_videos)}] Video: {original_name}")
-                  print(f"[Title] Tiêu đề YouTube: {title}")
+                  print(f"[Title] Tiêu đề YouTube (dùng chung một tiêu đề): {title}")
           
                   local_video = None
                   local_thumb = None
@@ -563,30 +473,16 @@ jobs:
                       video_succeeded += 1
                       print(f"[YouTube] Video upload thành công: https://www.youtube.com/watch?v={video_id}")
           
-                      thumb_path = thumb_mapping.get(item["id"])
-                      # Nếu chưa ghép được theo tên/thứ tự, lấy ảnh đầu tiên A-Z
-                      # trong thư mục thumb/ của repository cho video lần này.
-                      if thumb_path is None:
-                          available_thumbs = sorted(
-                              [path for path in thumb_dir.iterdir() if is_thumbnail_path(path)],
-                              key=lambda path: path.name.casefold(),
-                          ) if thumb_dir.is_dir() else []
-                          if available_thumbs:
-                              thumb_path = available_thumbs[0]
-                      if thumb_path:
-                          try:
-                              local_thumb = thumb_path
-                              upload_thumbnail(youtube, video_id, local_thumb)
-                              thumbnail_succeeded += 1
-                              print(f"[YouTube] Đã đặt thumbnail từ repository: {thumb_path.name}")
-                          except Exception as thumb_exc:
-                              thumbnail_failed += 1
-                              print(
-                                  f"::error::Video đã upload nhưng đặt thumbnail thất bại "
-                                  f"({thumb_path.name}): {thumb_exc}"
-                              )
-                      else:
-                          print("::warning::Không có ảnh trong repository thumb/; giữ thumbnail YouTube tự tạo.")
+                      try:
+                          upload_thumbnail(youtube, video_id, thumb_path)
+                          thumbnail_succeeded += 1
+                          print(f"[YouTube] Đã đặt thumbnail duy nhất từ repository: {thumb_path.name}")
+                      except Exception as thumb_exc:
+                          thumbnail_failed += 1
+                          print(
+                              f"::error::Video đã upload nhưng đặt thumbnail thất bại "
+                              f"({thumb_path.name}): {thumb_exc}"
+                          )
           
                   except HttpError as exc:
                       video_failed += 1
